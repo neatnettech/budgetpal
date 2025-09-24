@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Poetry
+poetry.lock
+.poetry/
+
+# Local database / SQLite
+*.db
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# Testing / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# IDE / Editor configs
+.vscode/
+.idea/
+*.swp
+
