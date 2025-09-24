@@ -11,11 +11,11 @@ from textual.widgets import Button, DataTable, Footer, Header, Label, Static, Ta
 
 from budgetpal.domain.models import AccountType, TransactionType
 from budgetpal.infrastructure.database import Database, DatabaseConfig
-from budgetpal.infrastructure.repositories import (
-    AccountRepository,
-    CategoryRepository,
-    TransactionRepository,
-)
+from budgetpal.infrastructure.logging import get_logger
+from dependency_injector.wiring import Provide, inject
+
+from budgetpal.application.interfaces import AccountFacadeInterface, TransactionFacadeInterface
+from budgetpal.infrastructure.containers import Container as DIContainer
 from budgetpal.presentation.components.cards import (
     AccountCardClicked,
     AccountGrid,
@@ -32,9 +32,15 @@ class DashboardScreen(Screen):
         Binding("r", "refresh", "Refresh"),
     ]
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.transaction_facade = transaction_facade
+        self.account_facade = account_facade
         self.account_grid = None
         self.stats_card = None
 
@@ -51,7 +57,7 @@ class DashboardScreen(Screen):
 
             # Recent transactions section
             yield Label("Recent Transactions", id="transactions-title")
-            yield RecentTransactions(self.db)
+            yield RecentTransactions()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -67,71 +73,55 @@ class DashboardScreen(Screen):
         self.load_account_cards()
 
     def load_quick_stats(self) -> None:
-        """Load quick statistics"""
+        """Load quick statistics using facades"""
         stats_container = self.query_one("#stats-container", Container)
         stats_container.remove_children()
 
-        with self.db.get_session() as session:
-            acc_repo = AccountRepository(session)
-            trans_repo = TransactionRepository(session)
+        # Use facades instead of direct repository access
+        accounts = self.account_facade.get_all_accounts()
+        total_balance = self.account_facade.get_total_balance("CHF")
 
-            # Calculate statistics
-            accounts = acc_repo.get_active_accounts()
-            total_balance = sum(acc.balance for acc in accounts if acc.currency == "CHF")
+        # Get monthly stats from transaction facade
+        monthly_stats_data = self.transaction_facade.get_monthly_stats()
 
-            # Monthly stats
-            from datetime import date
-            today = date.today()
-            start_of_month = date(today.year, today.month, 1)
-            transactions = trans_repo.get_by_date_range(start_of_month, today)
+        # Create stats cards
+        overview_stats = {
+            "Total Balance": f"CHF {total_balance:,.2f}",
+            "Active Accounts": str(len(accounts)),
+        }
 
-            income = sum(
-                t.amount for t in transactions if t.transaction_type == TransactionType.INCOME
-            )
-            expenses = sum(
-                t.amount for t in transactions if t.transaction_type == TransactionType.EXPENSE
-            )
-            net = income - expenses
+        monthly_stats = {
+            "Income": f"+CHF {monthly_stats_data['income']:,.2f}",
+            "Expenses": f"-CHF {monthly_stats_data['expenses']:,.2f}",
+            "Net Flow": f"{'+' if monthly_stats_data['net'] >= 0 else ''}CHF {monthly_stats_data['net']:,.2f}",
+        }
 
-            # Create stats cards
-            overview_stats = {
-                "Total Balance": f"CHF {total_balance:,.2f}",
-                "Active Accounts": str(len(accounts)),
-            }
-
-            monthly_stats = {
-                "Income": f"+CHF {income:,.2f}",
-                "Expenses": f"-CHF {expenses:,.2f}",
-                "Net Flow": f"{'+' if net >= 0 else ''}CHF {net:,.2f}",
-            }
-
-            # Create horizontal layout for stats
-            overview_card = QuickStatsCard("Overview", overview_stats)
-            monthly_card = QuickStatsCard("This Month", monthly_stats)
-            stats_container.mount(overview_card)
-            stats_container.mount(monthly_card)
+        # Create horizontal layout for stats
+        overview_card = QuickStatsCard("Overview", overview_stats)
+        monthly_card = QuickStatsCard("This Month", monthly_stats)
+        stats_container.mount(overview_card)
+        stats_container.mount(monthly_card)
 
     def load_account_cards(self) -> None:
-        """Load account cards in grid layout"""
+        """Load account cards in grid layout using facades"""
         accounts_container = self.query_one("#accounts-container", Container)
         accounts_container.remove_children()
 
-        with self.db.get_session() as session:
-            repo = AccountRepository(session)
-            accounts = repo.get_active_accounts()
+        # Use facade instead of direct repository access
+        accounts = self.account_facade.get_all_accounts()
 
-            if accounts:
-                self.account_grid = AccountGrid(accounts)
-                accounts_container.mount(self.account_grid)
-            else:
-                accounts_container.mount(Label("No accounts found. Press 'a' to add your first account."))
+        if accounts:
+            self.account_grid = AccountGrid(accounts)
+            accounts_container.mount(self.account_grid)
+        else:
+            accounts_container.mount(Label("No accounts found. Press 'a' to add your first account."))
 
     @on(AccountCardClicked)
     def on_account_card_clicked(self, event: AccountCardClicked) -> None:
         """Handle account card clicks - navigate directly to account detail"""
         from budgetpal.presentation.screens.account_detail import AccountDetailScreen
         self.app.push_screen(
-            AccountDetailScreen(self.db, event.account),
+            AccountDetailScreen(event.account),
             callback=self.on_screen_return
         )
 
@@ -142,7 +132,7 @@ class DashboardScreen(Screen):
     def action_add_account(self) -> None:
         """Add new account from dashboard"""
         from budgetpal.presentation.modals.account_modals import AddAccountModal
-        self.app.push_screen(AddAccountModal(self.db), callback=self.on_account_added)
+        self.app.push_screen(AddAccountModal(), callback=self.on_account_added)
 
     def action_refresh(self) -> None:
         """Refresh dashboard data"""
@@ -171,9 +161,13 @@ class AccountsScreen(Screen):
         Binding("r", "refresh", "Refresh"),
     ]
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.account_facade = account_facade
         self.selected_account = None
         self.accounts_table = DataTable()
 
@@ -197,56 +191,49 @@ class AccountsScreen(Screen):
 
     def load_accounts(self) -> None:
         self.accounts_table.clear()
-        total_balance = Decimal("0")
 
-        with self.db.get_session() as session:
-            repo = AccountRepository(session)
-            accounts = repo.get_active_accounts()
+        # Use facade instead of direct repository access
+        accounts = self.account_facade.get_all_accounts()
+        total_balance = self.account_facade.get_total_balance("CHF")
 
-            for account in accounts:
-                # Calculate goal progress
-                progress = ""
-                if account.goal_amount:
-                    pct = min(100, int((account.balance / account.goal_amount) * 100))
-                    progress = f"{pct}%"
+        for account in accounts:
+            # Calculate goal progress
+            progress = ""
+            if account.goal_amount:
+                pct = min(100, int((account.balance / account.goal_amount) * 100))
+                progress = f"{pct}%"
 
-                # Add row to table
-                self.accounts_table.add_row(
-                    account.name,
-                    account.account_type.value.replace("_", " ").title(),
-                    f"{account.balance:,.2f}",
-                    account.currency,
-                    f"{account.goal_amount:,.2f}" if account.goal_amount else "-",
-                    progress,
-                    key=str(account.id),
-                )
+            # Add row to table
+            self.accounts_table.add_row(
+                account.name,
+                account.account_type.value.replace("_", " ").title(),
+                f"{account.balance:,.2f}",
+                account.currency,
+                f"{account.goal_amount:,.2f}" if account.goal_amount else "-",
+                progress,
+                key=str(account.id),
+            )
 
-                # Add to total if same currency (CHF)
-                if account.currency == "CHF":
-                    total_balance += account.balance
-
-            # Update summary
-            self.query_one("#total-balance").update(f"Total Balance: CHF {total_balance:,.2f}")
-            self.query_one("#account-count").update(f"Active Accounts: {len(accounts)}")
+        # Update summary
+        self.query_one("#total-balance").update(f"Total Balance: CHF {total_balance:,.2f}")
+        self.query_one("#account-count").update(f"Active Accounts: {len(accounts)}")
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected) -> None:
         """Store selected account when row is clicked"""
         if event.row_key:
-            with self.db.get_session() as session:
-                repo = AccountRepository(session)
-                from uuid import UUID
-                self.selected_account = repo.get_by_id(UUID(str(event.row_key.value)))
+            from uuid import UUID
+            self.selected_account = self.account_facade.get_account_by_id(UUID(str(event.row_key.value)))
 
     def action_add_account(self) -> None:
         from budgetpal.presentation.modals.account_modals import AddAccountModal
-        self.app.push_screen(AddAccountModal(self.db), callback=self.on_account_modified)
+        self.app.push_screen(AddAccountModal(), callback=self.on_account_modified)
 
     def action_edit_account(self) -> None:
         if self.selected_account:
             from budgetpal.presentation.modals.account_modals import EditAccountModal
             self.app.push_screen(
-                EditAccountModal(self.db, self.selected_account),
+                EditAccountModal(self.selected_account),
                 callback=self.on_account_modified
             )
         else:
@@ -262,7 +249,7 @@ class AccountsScreen(Screen):
         if self.selected_account:
             from budgetpal.presentation.modals.account_modals import DeleteAccountModal
             self.app.push_screen(
-                DeleteAccountModal(self.db, self.selected_account),
+                DeleteAccountModal(self.selected_account),
                 callback=self.on_account_modified
             )
         else:
@@ -277,7 +264,7 @@ class AccountsScreen(Screen):
     def action_view_account(self) -> None:
         if self.selected_account:
             from budgetpal.presentation.screens.account_detail import AccountDetailScreen
-            self.app.push_screen(AccountDetailScreen(self.db, self.selected_account))
+            self.app.push_screen(AccountDetailScreen(self.selected_account))
         else:
             from budgetpal.presentation.components.dialogs import InfoDialog
             self.app.push_screen(
@@ -306,9 +293,15 @@ class TransactionsScreen(Screen):
         Binding("f", "filter", "Filter"),
     ]
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.transaction_facade = transaction_facade
+        self.account_facade = account_facade
         self.transactions_table = DataTable()
 
     def compose(self) -> ComposeResult:
@@ -326,60 +319,66 @@ class TransactionsScreen(Screen):
     def load_transactions(self) -> None:
         self.transactions_table.clear()
 
-        with self.db.get_session() as session:
-            trans_repo = TransactionRepository(session)
-            cat_repo = CategoryRepository(session)
-            acc_repo = AccountRepository(session)
+        # Use facade instead of direct repository access
+        transactions = self.transaction_facade.get_all_transactions(limit=100)
 
-            transactions = trans_repo.get_all()
-            transactions.sort(key=lambda t: t.transaction_date, reverse=True)
-
-            for trans in transactions[:100]:  # Show last 100 transactions
-                category_name = "-"
-                if trans.category_id:
-                    category = cat_repo.get_by_id(trans.category_id)
-                    if category:
-                        category_name = category.name
-
-                account = acc_repo.get_by_id(trans.from_account_id)
-                account_name = account.name if account else "-"
-
-                amount_str = f"{trans.amount:,.2f}"
-                if trans.transaction_type == TransactionType.EXPENSE:
-                    amount_str = f"-{amount_str}"
-                elif trans.transaction_type == TransactionType.INCOME:
-                    amount_str = f"+{amount_str}"
-
-                self.transactions_table.add_row(
-                    trans.transaction_date.strftime("%Y-%m-%d"),
-                    trans.description[:40],
-                    category_name,
-                    account_name,
-                    amount_str,
-                    trans.transaction_type.value,
-                )
+        for trans in transactions:
+            self.transactions_table.add_row(
+                trans["date"],
+                trans["description"][:40],
+                trans["category_name"],
+                trans["account_name"],
+                trans["amount_display"],
+                trans["type"],
+            )
 
     def action_add_transaction(self) -> None:
-        # For transactions screen, we need to pick a default account or show account selector
-        with self.db.get_session() as session:
-            from budgetpal.infrastructure.repositories import AccountRepository
-            repo = AccountRepository(session)
-            accounts = repo.get_active_accounts()
+        # Use facade instead of direct repository access
+        accounts = self.account_facade.get_all_accounts()
 
-            if accounts:
-                # Use the first account as default for transactions screen
-                from budgetpal.presentation.modals.transaction_modals import AddTransactionModal
-                self.app.push_screen(AddTransactionModal(self.db, accounts[0].id), callback=self.on_transaction_added)
-            else:
-                from budgetpal.presentation.components.dialogs import InfoDialog
-                self.app.push_screen(InfoDialog(
-                    title="No Accounts",
-                    message="Please create an account first before adding transactions."
-                ))
+        if accounts:
+            # Use the first account as default for transactions screen
+            from budgetpal.presentation.modals.transaction_modals import AddTransactionModal
+            # Note: We'll need to refactor AddTransactionModal to use facades too
+            self.app.push_screen(AddTransactionModal(accounts[0].id), callback=self.on_transaction_added)
+        else:
+            from budgetpal.presentation.components.dialogs import InfoDialog
+            self.app.push_screen(InfoDialog(
+                title="No Accounts",
+                message="Please create an account first before adding transactions."
+            ))
 
     def on_transaction_added(self, result: bool) -> None:
         if result:
             self.load_transactions()
+
+    def action_edit_transaction(self) -> None:
+        """Edit selected transaction"""
+        # TODO: Implement transaction editing functionality
+        from budgetpal.presentation.components.dialogs import InfoDialog
+        self.app.push_screen(InfoDialog(
+            title="Feature Coming Soon",
+            message="Transaction editing will be implemented soon."
+        ))
+
+    def action_delete_transaction(self) -> None:
+        """Delete selected transaction"""
+        # TODO: Implement transaction deletion functionality
+        from budgetpal.presentation.components.dialogs import InfoDialog
+        self.app.push_screen(InfoDialog(
+            title="Feature Coming Soon",
+            message="Transaction deletion will be implemented soon."
+        ))
+
+    def action_filter(self) -> None:
+        """Filter transactions"""
+        # TODO: Implement transaction filtering functionality
+        from budgetpal.presentation.components.dialogs import InfoDialog
+        self.app.push_screen(InfoDialog(
+            title="Feature Coming Soon",
+            message="Transaction filtering will be implemented soon."
+        ))
+
 
 
 class BudgetPalApp(App):
@@ -446,6 +445,7 @@ class BudgetPalApp(App):
         padding: 1;
     }
 
+
     /* Widgets */
     RecentTransactions {
         height: 20;
@@ -495,14 +495,32 @@ class BudgetPalApp(App):
 
     def __init__(self, db_path: Path | None = None):
         super().__init__()
-        config = DatabaseConfig(db_path)
-        self.db = Database(config)
-        self.db.create_tables()
-        self._initialize_default_data()
+        self.logger = get_logger("budgetpal.app")
 
-    def _initialize_default_data(self) -> None:
+        self.logger.info("Initializing BudgetPal application", db_path=str(db_path) if db_path else "default")
+
+        try:
+            # Set up dependency injection
+            self.container = DIContainer()
+            self.container.config.database.path.from_value(db_path)
+            self.container.wire(packages=["budgetpal.presentation"])
+            self.logger.debug("Dependency injection container configured")
+
+            # Initialize database and default data
+            db = self.container.database()
+            db.create_tables()
+            self.logger.info("Database initialized successfully")
+
+        except Exception as e:
+            self.logger.error("Failed to initialize application", error=str(e), exc_info=True)
+            raise
+        self._initialize_default_data(db)
+
+    def _initialize_default_data(self, db: Database) -> None:
         """Create default categories and accounts if none exist"""
-        with self.db.get_session() as session:
+        from budgetpal.infrastructure.repositories import AccountRepository, CategoryRepository
+
+        with db.get_session() as session:
             cat_repo = CategoryRepository(session)
             acc_repo = AccountRepository(session)
 
@@ -557,16 +575,17 @@ class BudgetPalApp(App):
             session.commit()
 
     def on_mount(self) -> None:
-        self.push_screen(DashboardScreen(self.db))
+        # All screens now use dependency injection
+        self.push_screen(DashboardScreen())
 
     def action_switch_dashboard(self) -> None:
-        self.switch_screen(DashboardScreen(self.db))
+        self.switch_screen(DashboardScreen())
 
     def action_switch_accounts(self) -> None:
-        self.switch_screen(AccountsScreen(self.db))
+        self.switch_screen(AccountsScreen())
 
     def action_switch_transactions(self) -> None:
-        self.switch_screen(TransactionsScreen(self.db))
+        self.switch_screen(TransactionsScreen())
 
     def action_quit(self) -> None:
         self.exit()

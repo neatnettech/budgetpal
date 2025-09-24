@@ -28,8 +28,8 @@ E = TypeVar("E")
 
 
 class BaseRepository(ABC, Generic[T, E]):
-    def __init__(self, session: Session, model_class: type[T], entity_class: type[E]):
-        self.session = session
+    def __init__(self, db: Database, model_class: type[T], entity_class: type[E]):
+        self.db = db
         self.model_class = model_class
         self.entity_class = entity_class
 
@@ -41,46 +41,62 @@ class BaseRepository(ABC, Generic[T, E]):
     def _to_model(self, entity: E) -> T:
         pass
 
-    def add(self, model: T) -> T:
-        entity = self._to_entity(model)
-        self.session.add(entity)
-        self.session.flush()
-        return self._to_model(entity)
+    def add(self, model: T, session=None) -> T:
+        \"\"\"Add entity - uses own session if none provided\"\"\"
+        if session:
+            # Work within provided session (transactional mode)
+            entity = self._to_entity(model)
+            session.add(entity)
+            session.flush()
+            return self._to_model(entity)
+        else:
+            # Manage own session (standalone mode)
+            with self.db.get_session() as session:
+                entity = self._to_entity(model)
+                session.add(entity)
+                session.flush()
+                session.commit()
+                return self._to_model(entity)
 
     def get_by_id(self, id: UUID) -> Optional[T]:
-        entity = self.session.get(self.entity_class, str(id))
-        return self._to_model(entity) if entity else None
+        with self.db.get_session() as session:
+            entity = session.get(self.entity_class, str(id))
+            return self._to_model(entity) if entity else None
 
     def get_all(self) -> list[T]:
-        stmt = select(self.entity_class)
-        entities = self.session.execute(stmt).scalars().all()
-        return [self._to_model(entity) for entity in entities]
+        with self.db.get_session() as session:
+            stmt = select(self.entity_class)
+            entities = session.execute(stmt).scalars().all()
+            return [self._to_model(entity) for entity in entities]
 
     def update(self, model: T) -> T:
-        entity = self.session.get(self.entity_class, str(model.id))
-        if not entity:
-            raise ValueError(f"Entity with id {model.id} not found")
+        with self.db.get_session() as session:
+            entity = session.get(self.entity_class, str(model.id))
+            if not entity:
+                raise ValueError(f"Entity with id {model.id} not found")
 
-        # Convert model to dict, excluding computed fields
-        data = model.model_dump(exclude={"id", "created_at"})
+            # Convert model to dict, excluding computed fields
+            data = model.model_dump(exclude={"id", "created_at"})
 
-        for key, value in data.items():
-            if hasattr(entity, key):
-                setattr(entity, key, value)
+            for key, value in data.items():
+                if hasattr(entity, key):
+                    setattr(entity, key, value)
 
-        self.session.flush()
-        return self._to_model(entity)
+            session.flush()
+            session.commit()
+            return self._to_model(entity)
 
     def delete(self, id: UUID) -> None:
-        entity = self.session.get(self.entity_class, str(id))
-        if entity:
-            self.session.delete(entity)
-            self.session.flush()
+        with self.db.get_session() as session:
+            entity = session.get(self.entity_class, str(id))
+            if entity:
+                session.delete(entity)
+                session.commit()
 
 
 class AccountRepository(BaseRepository[Account, AccountEntity]):
-    def __init__(self, session: Session):
-        super().__init__(session, Account, AccountEntity)
+    def __init__(self, db: Database):
+        super().__init__(db, Account, AccountEntity)
 
     def _to_entity(self, model: Account) -> AccountEntity:
         return AccountEntity(
@@ -139,25 +155,45 @@ class AccountRepository(BaseRepository[Account, AccountEntity]):
         self.session.flush()
         return self._to_model(entity)
 
-    def update_balance(self, account_id: UUID, amount: Decimal, operation: str = "add") -> Account:
-        entity = self.session.get(AccountEntity, str(account_id))
-        if not entity:
-            raise ValueError(f"Account with id {account_id} not found")
+    def update_balance(self, account_id: UUID, amount: Decimal, operation: str = "add", session=None) -> Account:
+        """Update account balance - uses own session if none provided"""
+        if session:
+            # Work within provided session (transactional mode)
+            entity = session.get(AccountEntity, str(account_id))
+            if not entity:
+                raise ValueError(f"Account with id {account_id} not found")
 
-        if operation == "add":
-            entity.balance += amount
-        elif operation == "subtract":
-            entity.balance -= amount
+            if operation == "add":
+                entity.balance += amount
+            elif operation == "subtract":
+                entity.balance -= amount
+            else:
+                entity.balance = amount
+
+            session.flush()
+            return self._to_model(entity)
         else:
-            entity.balance = amount
+            # Manage own session (standalone mode)
+            with self.db.get_session() as session:
+                entity = session.get(AccountEntity, str(account_id))
+                if not entity:
+                    raise ValueError(f"Account with id {account_id} not found")
 
-        self.session.flush()
-        return self._to_model(entity)
+                if operation == "add":
+                    entity.balance += amount
+                elif operation == "subtract":
+                    entity.balance -= amount
+                else:
+                    entity.balance = amount
+
+                session.flush()
+                session.commit()
+                return self._to_model(entity)
 
 
 class CategoryRepository(BaseRepository[Category, CategoryEntity]):
-    def __init__(self, session: Session):
-        super().__init__(session, Category, CategoryEntity)
+    def __init__(self, db: Database):
+        super().__init__(db, Category, CategoryEntity)
 
     def _to_entity(self, model: Category) -> CategoryEntity:
         return CategoryEntity(
@@ -185,8 +221,8 @@ class CategoryRepository(BaseRepository[Category, CategoryEntity]):
 
 
 class TransactionRepository(BaseRepository[Transaction, TransactionEntity]):
-    def __init__(self, session: Session):
-        super().__init__(session, Transaction, TransactionEntity)
+    def __init__(self, db: Database):
+        super().__init__(db, Transaction, TransactionEntity)
 
     def _to_entity(self, model: Transaction) -> TransactionEntity:
         return TransactionEntity(
@@ -248,8 +284,8 @@ class TransactionRepository(BaseRepository[Transaction, TransactionEntity]):
 
 
 class RecurringTransactionRepository(BaseRepository[RecurringTransaction, RecurringTransactionEntity]):
-    def __init__(self, session: Session):
-        super().__init__(session, RecurringTransaction, RecurringTransactionEntity)
+    def __init__(self, db: Database):
+        super().__init__(db, RecurringTransaction, RecurringTransactionEntity)
 
     def _to_entity(self, model: RecurringTransaction) -> RecurringTransactionEntity:
         return RecurringTransactionEntity(
@@ -301,8 +337,8 @@ class RecurringTransactionRepository(BaseRepository[RecurringTransaction, Recurr
 
 
 class BudgetRepository(BaseRepository[Budget, BudgetEntity]):
-    def __init__(self, session: Session):
-        super().__init__(session, Budget, BudgetEntity)
+    def __init__(self, db: Database):
+        super().__init__(db, Budget, BudgetEntity)
 
     def _to_entity(self, model: Budget) -> BudgetEntity:
         return BudgetEntity(

@@ -11,9 +11,12 @@ from textual.containers import Container
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select
 
+from dependency_injector.wiring import Provide, inject
+
+from budgetpal.application.interfaces import AccountFacadeInterface, TransactionFacadeInterface
 from budgetpal.domain.models import Account, AccountType
-from budgetpal.infrastructure.database import Database
-from budgetpal.infrastructure.repositories import AccountRepository, TransactionRepository
+from budgetpal.infrastructure.containers import Container as DIContainer
+from budgetpal.infrastructure.logging import get_logger
 from budgetpal.presentation.components.dialogs import ConfirmationDialog, ErrorDialog
 from budgetpal.presentation.components.forms import (
     DateInput,
@@ -67,10 +70,13 @@ class BaseAccountModal(ModalScreen):
     }
     """
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
         super().__init__()
-        self.db = db
-        self.form: Optional[Form] = None
+        self.account_facade = account_facade
 
 
 class AddAccountModal(BaseAccountModal):
@@ -153,23 +159,24 @@ class AddAccountModal(BaseAccountModal):
                 await self.app.push_screen(ErrorDialog(message="Name and account type are required"))
                 return
 
-            account = Account(
-                name=name,
-                account_type=account_type,
-                balance=Decimal(balance) if balance else Decimal("0"),
-                currency=currency or "CHF",
-                description=description if description else None,
-                goal_amount=Decimal(goal_amount) if goal_amount else None,
-                goal_date=date.fromisoformat(goal_date) if goal_date else None,
-            )
+            account_data = {
+                "name": name,
+                "account_type": account_type,
+                "balance": Decimal(balance) if balance else Decimal("0"),
+                "currency": currency or "CHF",
+                "description": description if description else None,
+                "goal_amount": Decimal(goal_amount) if goal_amount else None,
+                "goal_date": date.fromisoformat(goal_date) if goal_date else None,
+            }
 
-            with self.db.get_session() as session:
-                repo = AccountRepository(session)
-                repo.add(account)
-                session.commit()
-
-            self.dismiss(True)
+            success = self.account_facade.add_account(account_data)
+            if success:
+                self.dismiss(True)
+            else:
+                await self.app.push_screen(ErrorDialog(message="Failed to add account"))
         except Exception as e:
+            logger = get_logger("budgetpal.modals.account")
+            logger.error("Failed to save account", error=str(e), exc_info=True)
             await self.app.push_screen(ErrorDialog(message=str(e)))
 
     @on(Button.Pressed, "#cancel-button")
@@ -180,8 +187,13 @@ class AddAccountModal(BaseAccountModal):
 class EditAccountModal(BaseAccountModal):
     """Modal for editing existing accounts"""
 
-    def __init__(self, db: Database, account: Account):
-        super().__init__(db)
+    @inject
+    def __init__(
+        self,
+        account: Account,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
+        super().__init__(account_facade=account_facade)
         self.account = account
 
     def compose(self) -> ComposeResult:
@@ -263,22 +275,33 @@ class EditAccountModal(BaseAccountModal):
                 await self.app.push_screen(ErrorDialog(message="Name and account type are required"))
                 return
 
-            # Update account with new values
-            self.account.name = name
-            self.account.account_type = account_type
-            self.account.balance = Decimal(balance) if balance else Decimal("0")
-            self.account.currency = currency or "CHF"
-            self.account.description = description if description else None
-            self.account.goal_amount = Decimal(goal_amount) if goal_amount else None
-            self.account.goal_date = date.fromisoformat(goal_date) if goal_date else None
+            # Prepare updated account data
+            updated_data = {
+                "name": name,
+                "account_type": account_type,
+                "balance": Decimal(balance) if balance else Decimal("0"),
+                "currency": currency or "CHF",
+                "description": description if description else None,
+                "goal_amount": Decimal(goal_amount) if goal_amount else None,
+                "goal_date": date.fromisoformat(goal_date) if goal_date else None,
+            }
 
-            with self.db.get_session() as session:
-                repo = AccountRepository(session)
-                repo.update(self.account)
-                session.commit()
-
-            self.dismiss(True)
+            success = self.account_facade.update_account(self.account.id, updated_data)
+            if success:
+                # Update local account object for consistency
+                self.account.name = name
+                self.account.account_type = account_type
+                self.account.balance = Decimal(balance) if balance else Decimal("0")
+                self.account.currency = currency or "CHF"
+                self.account.description = description if description else None
+                self.account.goal_amount = Decimal(goal_amount) if goal_amount else None
+                self.account.goal_date = date.fromisoformat(goal_date) if goal_date else None
+                self.dismiss(True)
+            else:
+                await self.app.push_screen(ErrorDialog(message="Failed to update account"))
         except Exception as e:
+            logger = get_logger("budgetpal.modals.account")
+            logger.error("Failed to update account", error=str(e), exc_info=True)
             # More detailed error message for debugging
             error_msg = f"Failed to update account: {str(e)}"
             if "sqlite3.ProgrammingError" in str(type(e)):
@@ -328,9 +351,16 @@ class DeleteAccountModal(ModalScreen):
     }
     """
 
-    def __init__(self, db: Database, account: Account):
+    @inject
+    def __init__(
+        self,
+        account: Account,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.account_facade = account_facade
+        self.transaction_facade = transaction_facade
         self.account = account
         self.transaction_count = 0
 
@@ -353,15 +383,9 @@ class DeleteAccountModal(ModalScreen):
             yield FormButtons(save_label="Delete", cancel_label="Cancel")
 
     def on_mount(self) -> None:
-        # Count related transactions
-        with self.db.get_session() as session:
-            trans_repo = TransactionRepository(session)
-            all_trans = trans_repo.get_all()
-            self.transaction_count = sum(
-                1 for t in all_trans
-                if t.from_account_id == self.account.id or t.to_account_id == self.account.id
-            )
-            self.query_one("#transaction-count").update(f"Transactions: {self.transaction_count}")
+        # Count related transactions using facade
+        self.transaction_count = self.transaction_facade.count_transactions_by_account(self.account.id)
+        self.query_one("#transaction-count").update(f"Transactions: {self.transaction_count}")
 
     @on(Button.Pressed, "#save-button")
     async def confirm_delete(self) -> None:
@@ -377,22 +401,15 @@ class DeleteAccountModal(ModalScreen):
 
         if result:
             try:
-                with self.db.get_session() as session:
-                    acc_repo = AccountRepository(session)
-                    trans_repo = TransactionRepository(session)
-
-                    # Delete related transactions first
-                    all_trans = trans_repo.get_all()
-                    for trans in all_trans:
-                        if trans.from_account_id == self.account.id or trans.to_account_id == self.account.id:
-                            trans_repo.delete(trans.id)
-
-                    # Delete the account
-                    acc_repo.delete(self.account.id)
-                    session.commit()
-
-                self.dismiss(True)
+                # Use facade to delete account and related transactions
+                success = self.account_facade.delete_account(self.account.id)
+                if success:
+                    self.dismiss(True)
+                else:
+                    await self.app.push_screen(ErrorDialog(message="Failed to delete account"))
             except Exception as e:
+                logger = get_logger("budgetpal.modals.account")
+                logger.error("Failed to delete account", error=str(e), exc_info=True)
                 await self.app.push_screen(ErrorDialog(message=f"Failed to delete account: {str(e)}"))
 
     @on(Button.Pressed, "#cancel-button")

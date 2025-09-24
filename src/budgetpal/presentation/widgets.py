@@ -1,21 +1,28 @@
 from datetime import date, timedelta
 from decimal import Decimal
 
+from dependency_injector.wiring import Provide, inject
 from textual.app import ComposeResult
 from textual.containers import Container, Grid, Horizontal, Vertical
 from textual.widgets import DataTable, Label, ProgressBar, Static
 
+from budgetpal.application.interfaces import AccountFacadeInterface, TransactionFacadeInterface
 from budgetpal.domain.models import Account, TransactionType
-from budgetpal.infrastructure.database import Database
-from budgetpal.infrastructure.repositories import AccountRepository, TransactionRepository
+from budgetpal.infrastructure.containers import Container as DIContainer
 
 
 class QuickStats(Static):
     """Display quick financial statistics"""
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.account_facade = account_facade
+        self.transaction_facade = transaction_facade
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -36,31 +43,16 @@ class QuickStats(Static):
         self.update_stats()
 
     def update_stats(self) -> None:
-        with self.db.get_session() as session:
-            acc_repo = AccountRepository(session)
-            trans_repo = TransactionRepository(session)
+        # Use facades instead of direct repository access
+        total_balance = self.account_facade.get_total_balance("CHF")
+        self.query_one("#total-balance").update(f"{total_balance:,.2f} CHF")
 
-            # Calculate total balance
-            accounts = acc_repo.get_active_accounts()
-            total_balance = sum(acc.balance for acc in accounts)
-            self.query_one("#total-balance").update(f"{total_balance:,.2f} CHF")
+        # Get monthly stats from transaction facade
+        monthly_stats = self.transaction_facade.get_monthly_stats()
 
-            # Calculate monthly stats
-            today = date.today()
-            start_of_month = date(today.year, today.month, 1)
-            transactions = trans_repo.get_by_date_range(start_of_month, today)
-
-            income = sum(
-                t.amount for t in transactions if t.transaction_type == TransactionType.INCOME
-            )
-            expenses = sum(
-                t.amount for t in transactions if t.transaction_type == TransactionType.EXPENSE
-            )
-            net = income - expenses
-
-            self.query_one("#monthly-income").update(f"Income: {income:,.2f}")
-            self.query_one("#monthly-expenses").update(f"Expenses: {expenses:,.2f}")
-            self.query_one("#monthly-net").update(f"Net: {net:+,.2f}")
+        self.query_one("#monthly-income").update(f"Income: {monthly_stats['income']:,.2f}")
+        self.query_one("#monthly-expenses").update(f"Expenses: {monthly_stats['expenses']:,.2f}")
+        self.query_one("#monthly-net").update(f"Net: {monthly_stats['net']:+,.2f}")
 
 
 class AccountCard(Static):
@@ -85,9 +77,13 @@ class AccountCard(Static):
 class AccountsOverview(Static):
     """Display overview of all accounts"""
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.account_facade = account_facade
 
     def compose(self) -> ComposeResult:
         yield Label("Accounts", classes="section-title")
@@ -100,25 +96,28 @@ class AccountsOverview(Static):
         container = self.query_one("#accounts-list", Container)
         container.remove_children()
 
-        with self.db.get_session() as session:
-            repo = AccountRepository(session)
-            accounts = repo.get_active_accounts()
+        # Use facade instead of direct repository access
+        accounts = self.account_facade.get_all_accounts()
 
-            for account in accounts[:5]:  # Show top 5 accounts
-                account_info = Horizontal(
-                    Label(f"{account.name}:", classes="account-item-name"),
-                    Label(f"{account.balance:,.2f} {account.currency}", classes="account-item-balance"),
-                    classes="account-item",
-                )
-                container.mount(account_info)
+        for account in accounts[:5]:  # Show top 5 accounts
+            account_info = Horizontal(
+                Label(f"{account.name}:", classes="account-item-name"),
+                Label(f"{account.balance:,.2f} {account.currency}", classes="account-item-balance"),
+                classes="account-item",
+            )
+            container.mount(account_info)
 
 
 class RecentTransactions(Static):
     """Display recent transactions"""
 
-    def __init__(self, db: Database):
+    @inject
+    def __init__(
+        self,
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.transaction_facade = transaction_facade
         self.table = DataTable()
 
     def compose(self) -> ComposeResult:
@@ -132,25 +131,13 @@ class RecentTransactions(Static):
     def update_transactions(self) -> None:
         self.table.clear()
 
-        with self.db.get_session() as session:
-            repo = TransactionRepository(session)
-            today = date.today()
-            start_date = today - timedelta(days=30)
-            transactions = repo.get_by_date_range(start_date, today)
+        # Use facade instead of direct repository access
+        recent_transactions = self.transaction_facade.get_recent_transactions(days=30, limit=10)
 
-            # Sort by date descending
-            transactions.sort(key=lambda t: t.transaction_date, reverse=True)
-
-            for trans in transactions[:10]:  # Show last 10 transactions
-                amount_str = f"{trans.amount:,.2f}"
-                if trans.transaction_type == TransactionType.EXPENSE:
-                    amount_str = f"-{amount_str}"
-                elif trans.transaction_type == TransactionType.INCOME:
-                    amount_str = f"+{amount_str}"
-
-                self.table.add_row(
-                    trans.transaction_date.strftime("%m/%d"),
-                    trans.description[:30],
-                    amount_str,
-                    trans.transaction_type.value[:3].upper(),
-                )
+        for trans in recent_transactions:
+            self.table.add_row(
+                trans["date"],
+                trans["description"],
+                trans["amount"],
+                trans["type"],
+            )

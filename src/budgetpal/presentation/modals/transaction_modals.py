@@ -11,13 +11,12 @@ from textual.containers import Container
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select
 
+from dependency_injector.wiring import Provide, inject
+
+from budgetpal.application.interfaces import AccountFacadeInterface, CategoryFacadeInterface, TransactionFacadeInterface
 from budgetpal.domain.models import Transaction, TransactionType
-from budgetpal.infrastructure.database import Database
-from budgetpal.infrastructure.repositories import (
-    AccountRepository,
-    CategoryRepository,
-    TransactionRepository,
-)
+from budgetpal.infrastructure.containers import Container as DIContainer
+from budgetpal.infrastructure.logging import get_logger
 from budgetpal.presentation.components.dialogs import ErrorDialog
 from budgetpal.presentation.components.forms import (
     DateInput,
@@ -77,9 +76,18 @@ class AddTransactionModal(ModalScreen):
     }
     """
 
-    def __init__(self, db: Database, preselected_account: UUID):
+    @inject
+    def __init__(
+        self,
+        preselected_account: UUID,
+        account_facade: AccountFacadeInterface = Provide[DIContainer.account_facade],
+        category_facade: CategoryFacadeInterface = Provide[DIContainer.category_facade],
+        transaction_facade: TransactionFacadeInterface = Provide[DIContainer.transaction_facade],
+    ):
         super().__init__()
-        self.db = db
+        self.account_facade = account_facade
+        self.category_facade = category_facade
+        self.transaction_facade = transaction_facade
         self.preselected_account = preselected_account
         self.accounts = []
         self.categories = []
@@ -145,12 +153,9 @@ class AddTransactionModal(ModalScreen):
         self.setup_form()
 
     def load_data(self) -> None:
-        """Load accounts and categories from database"""
-        with self.db.get_session() as session:
-            acc_repo = AccountRepository(session)
-            cat_repo = CategoryRepository(session)
-            self.accounts = acc_repo.get_active_accounts()
-            self.categories = cat_repo.get_all()
+        """Load accounts and categories using facades"""
+        self.accounts = self.account_facade.get_all_accounts()
+        self.categories = self.category_facade.get_all_categories()
 
     def setup_form(self) -> None:
         """Setup form dropdowns with data"""
@@ -244,50 +249,29 @@ class AddTransactionModal(ModalScreen):
                 await self.app.push_screen(ErrorDialog(message="Income and expense transactions require a category"))
                 return
 
-            # Create transaction (ensure UUIDs are properly handled)
-            # Convert string UUIDs to UUID objects, handling both string and UUID inputs
-            to_account_uuid = None
-            if to_account_id:
-                to_account_uuid = to_account_id if isinstance(to_account_id, UUID) else UUID(str(to_account_id))
+            # Prepare transaction data for facade
 
-            category_uuid = None
-            if category_id:
-                category_uuid = category_id if isinstance(category_id, UUID) else UUID(str(category_id))
+            transaction_data = {
+                "amount": amount,
+                "description": description,
+                "transaction_type": trans_type,
+                "from_account_id": from_account_id,
+                "to_account_id": to_account_id,
+                "category_id": category_id,
+                "transaction_date": date.fromisoformat(trans_date),
+                "notes": notes if notes else None,
+            }
 
-            transaction = Transaction(
-                amount=Decimal(amount),
-                description=description,
-                transaction_type=trans_type,
-                from_account_id=from_account_id,  # This is already a UUID from preselected_account
-                to_account_id=to_account_uuid,
-                category_id=category_uuid,
-                transaction_date=date.fromisoformat(trans_date),
-                notes=notes if notes else None,
-            )
-
-            # Save transaction and update account balances
-            with self.db.get_session() as session:
-                trans_repo = TransactionRepository(session)
-                acc_repo = AccountRepository(session)
-
-                # Add transaction
-                trans_repo.add(transaction)
-
-                # Update account balances
-                if trans_type == TransactionType.EXPENSE:
-                    acc_repo.update_balance(from_account_id, transaction.amount, "subtract")
-                elif trans_type == TransactionType.INCOME:
-                    acc_repo.update_balance(from_account_id, transaction.amount, "add")
-                elif trans_type == TransactionType.TRANSFER:
-                    acc_repo.update_balance(from_account_id, transaction.amount, "subtract")
-                    if to_account_id:
-                        acc_repo.update_balance(to_account_id, transaction.amount, "add")
-
-                session.commit()
-
-            self.dismiss(True)
+            # Use facade to save transaction
+            success = self.transaction_facade.add_transaction(transaction_data)
+            if success:
+                self.dismiss(True)
+            else:
+                await self.app.push_screen(ErrorDialog(message="Failed to add transaction"))
 
         except Exception as e:
+            logger = get_logger("budgetpal.modals.transaction")
+            logger.error("Failed to add transaction", error=str(e), exc_info=True)
             error_msg = f"Failed to add transaction: {str(e)}"
             await self.app.push_screen(ErrorDialog(message=error_msg))
 

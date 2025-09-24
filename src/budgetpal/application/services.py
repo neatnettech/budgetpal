@@ -1,11 +1,14 @@
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from dateutil.relativedelta import relativedelta
+from dependency_injector.wiring import Provide, inject
 
+from budgetpal.application.interfaces import AccountServiceInterface, TransactionServiceInterface
 from budgetpal.domain.models import (
+    Account,
     Budget,
     RecurrenceFrequency,
     RecurringTransaction,
@@ -14,6 +17,7 @@ from budgetpal.domain.models import (
     TransactionType,
 )
 from budgetpal.infrastructure.database import Database
+from budgetpal.infrastructure.logging import LoggerMixin
 from budgetpal.infrastructure.repositories import (
     AccountRepository,
     BudgetRepository,
@@ -262,3 +266,275 @@ class ReportingService:
 
         trends.reverse()  # Return in chronological order
         return trends
+
+
+class TransactionService(TransactionServiceInterface, LoggerMixin):
+    \"\"\"Service for transaction business logic with proper DI\"\"\"
+
+    def __init__(
+        self,
+        transaction_repo: TransactionRepository,
+        account_repo: AccountRepository,
+        category_repo: CategoryRepository,
+    ):
+        super().__init__()
+        self.transaction_repo = transaction_repo
+        self.account_repo = account_repo
+        self.category_repo = category_repo
+
+    def create_transaction(self, transaction_data: dict) -> bool:
+        \"\"\"Create a new transaction and update account balances\"\"\"
+        self.logger.info(\"Creating transaction\",
+                        amount=transaction_data.get(\"amount\"),
+                        description=transaction_data.get(\"description\"),
+                        transaction_type=str(transaction_data.get(\"transaction_type\")))
+
+        try:
+            # Convert string UUIDs to UUID objects if needed
+            from_account_id = transaction_data[\"from_account_id\"]
+            if isinstance(from_account_id, str):
+                from_account_id = UUID(from_account_id)
+
+            to_account_id = transaction_data.get(\"to_account_id\")
+            if to_account_id and isinstance(to_account_id, str):
+                to_account_id = UUID(to_account_id)
+
+            category_id = transaction_data.get(\"category_id\")
+            if category_id and isinstance(category_id, str):
+                category_id = UUID(category_id)
+
+            # Create transaction domain object
+            transaction = Transaction(
+                amount=Decimal(str(transaction_data[\"amount\"])),
+                description=transaction_data[\"description\"],
+                transaction_type=transaction_data[\"transaction_type\"],
+                from_account_id=from_account_id,
+                to_account_id=to_account_id,
+                category_id=category_id,
+                transaction_date=transaction_data[\"transaction_date\"],
+                notes=transaction_data.get(\"notes\"),
+            )
+
+            # Coordinate repositories in shared transaction
+            with self.transaction_repo.db.get_session() as session:
+                # Save transaction using shared session
+                self.transaction_repo.add(transaction, session)
+
+                # Update account balances using shared session
+                if transaction.transaction_type == TransactionType.EXPENSE:
+                    self.account_repo.update_balance(transaction.from_account_id, transaction.amount, \"subtract\", session)
+                elif transaction.transaction_type == TransactionType.INCOME:
+                    self.account_repo.update_balance(transaction.from_account_id, transaction.amount, \"add\", session)
+                elif transaction.transaction_type == TransactionType.TRANSFER:
+                    self.account_repo.update_balance(transaction.from_account_id, transaction.amount, \"subtract\", session)
+                    if transaction.to_account_id:
+                        self.account_repo.update_balance(transaction.to_account_id, transaction.amount, \"add\", session)
+
+                session.commit()
+
+            self.logger.info(\"Transaction created successfully\")
+            return True
+
+        except Exception as e:
+            self.logger.error(\"Failed to create transaction\",
+                            error=str(e),
+                            transaction_data=transaction_data,
+                            exc_info=True)
+            return False
+
+    def get_all_transactions(self, limit: Optional[int] = None) -> List[dict]:
+        \"\"\"Get all transactions with enriched data\"\"\"
+        self.logger.debug(\"Fetching all transactions\", limit=limit)
+
+        transactions = self.transaction_repo.get_all()
+        if limit:
+            transactions = transactions[:limit]
+
+        enriched_transactions = []
+        for trans in transactions:
+            # Get related entities
+            from_account = self.account_repo.get_by_id(trans.from_account_id) if trans.from_account_id else None
+            to_account = self.account_repo.get_by_id(trans.to_account_id) if trans.to_account_id else None
+            category = self.category_repo.get_by_id(trans.category_id) if trans.category_id else None
+
+            enriched_trans = {
+                \"id\": str(trans.id),
+                \"amount\": trans.amount,
+                \"description\": trans.description,
+                \"transaction_type\": trans.transaction_type,
+                \"from_account_name\": from_account.name if from_account else \"Unknown\",
+                \"to_account_name\": to_account.name if to_account else None,
+                \"category_name\": category.name if category else None,
+                \"transaction_date\": trans.transaction_date,
+                \"notes\": trans.notes,
+                \"type_enum\": trans.transaction_type,
+            }
+            enriched_transactions.append(enriched_trans)
+
+        self.logger.info(\"Retrieved enriched transactions\", count=len(enriched_transactions))
+        return enriched_transactions
+
+    def get_transactions_by_account(self, account_id: UUID, limit: Optional[int] = None) -> List[dict]:
+        \"\"\"Get transactions for a specific account\"\"\"
+        # Implementation similar to get_all_transactions but filtered by account
+        all_transactions = self.get_all_transactions()
+        account_transactions = [
+            t for t in all_transactions
+            if (str(t.get(\"from_account_id\")) == str(account_id) or
+                str(t.get(\"to_account_id\")) == str(account_id))
+        ]
+        return account_transactions[:limit] if limit else account_transactions
+
+    def get_recent_transactions(self, days: int = 30, limit: int = 10) -> List[dict]:
+        \"\"\"Get recent transactions\"\"\"
+        today = date.today()
+        start_date = today - timedelta(days=days)
+        transactions = self.transaction_repo.get_by_date_range(start_date, today)
+
+        # Sort by date descending
+        transactions.sort(key=lambda t: t.transaction_date, reverse=True)
+
+        recent_transactions = []
+        for trans in transactions[:limit]:
+            amount_str = f\"{trans.amount:,.2f}\"
+            if trans.transaction_type == TransactionType.EXPENSE:
+                amount_str = f\"-{amount_str}\"
+            elif trans.transaction_type == TransactionType.INCOME:
+                amount_str = f\"+{amount_str}\"
+
+            recent_transactions.append({
+                \"date\": trans.transaction_date.strftime(\"%m/%d\"),
+                \"description\": trans.description[:30],
+                \"amount\": amount_str,
+                \"type\": trans.transaction_type.value[:3].upper(),
+            })
+
+        return recent_transactions
+
+    def get_monthly_stats(self, year: Optional[int] = None, month: Optional[int] = None) -> dict:
+        \"\"\"Get monthly statistics\"\"\"
+        if year is None or month is None:
+            today = date.today()
+            year = today.year
+            month = today.month
+
+        start_of_month = date(year, month, 1)
+        today = date.today()
+
+        transactions = self.transaction_repo.get_by_date_range(start_of_month, today)
+
+        income = sum(
+            t.amount for t in transactions if t.transaction_type == TransactionType.INCOME
+        )
+        expenses = sum(
+            t.amount for t in transactions if t.transaction_type == TransactionType.EXPENSE
+        )
+        net = income - expenses
+
+        return {
+            \"income\": income,
+            \"expenses\": expenses,
+            \"net\": net,
+        }
+
+    def count_transactions_by_account(self, account_id: UUID) -> int:
+        \"\"\"Count transactions for an account\"\"\"
+        all_trans = self.transaction_repo.get_all()
+        return sum(
+            1 for t in all_trans
+            if t.from_account_id == account_id or t.to_account_id == account_id
+        )
+
+
+class AccountService(AccountServiceInterface, LoggerMixin):
+    \"\"\"Service for account business logic with proper DI\"\"\"
+
+    @inject
+    def __init__(
+        self,
+        account_repo: AccountRepository = Provide['account_repository'],
+        transaction_repo: TransactionRepository = Provide['transaction_repository'],
+    ):
+        super().__init__()
+        self.account_repo = account_repo
+        self.transaction_repo = transaction_repo
+
+    def create_account(self, account_data: dict) -> bool:
+        \"\"\"Create a new account\"\"\"
+        self.logger.info(\"Creating account\",
+                        name=account_data.get(\"name\"),
+                        account_type=str(account_data.get(\"account_type\")))
+
+        try:
+            account = Account(
+                name=account_data[\"name\"],
+                account_type=account_data[\"account_type\"],
+                balance=account_data[\"balance\"],
+                currency=account_data[\"currency\"],
+                description=account_data.get(\"description\"),
+                goal_amount=account_data.get(\"goal_amount\"),
+                goal_date=account_data.get(\"goal_date\"),
+            )
+
+            self.account_repo.add(account)
+            self.logger.info(\"Account created successfully\")
+            return True
+
+        except Exception as e:
+            self.logger.error(\"Failed to create account\", error=str(e), exc_info=True)
+            return False
+
+    def update_account(self, account_id: UUID, account_data: dict) -> bool:
+        \"\"\"Update an existing account\"\"\"
+        try:
+            account = self.account_repo.get_by_id(account_id)
+            if not account:
+                return False
+
+            # Update account fields
+            account.name = account_data[\"name\"]
+            account.account_type = account_data[\"account_type\"]
+            account.balance = account_data[\"balance\"]
+            account.currency = account_data[\"currency\"]
+            account.description = account_data.get(\"description\")
+            account.goal_amount = account_data.get(\"goal_amount\")
+            account.goal_date = account_data.get(\"goal_date\")
+
+            self.account_repo.update(account)
+            self.logger.info(\"Account updated successfully\")
+            return True
+
+        except Exception as e:
+            self.logger.error(\"Failed to update account\", error=str(e), exc_info=True)
+            return False
+
+    def delete_account(self, account_id: UUID) -> bool:
+        \"\"\"Delete an account and related transactions\"\"\"
+        try:
+            # Delete related transactions first
+            all_trans = self.transaction_repo.get_all()
+            for trans in all_trans:
+                if trans.from_account_id == account_id or trans.to_account_id == account_id:
+                    self.transaction_repo.delete(trans.id)
+
+            # Delete the account
+            self.account_repo.delete(account_id)
+            self.logger.info(\"Account and related transactions deleted successfully\")
+            return True
+
+        except Exception as e:
+            self.logger.error(\"Failed to delete account\", error=str(e), exc_info=True)
+            return False
+
+    def get_all_accounts(self) -> List[Account]:
+        \"\"\"Get all accounts\"\"\"
+        return self.account_repo.get_active_accounts()
+
+    def get_account_by_id(self, account_id: UUID) -> Optional[Account]:
+        \"\"\"Get account by ID\"\"\"
+        return self.account_repo.get_by_id(account_id)
+
+    def get_total_balance(self, currency: str = \"CHF\") -> Decimal:
+        \"\"\"Get total balance\"\"\"
+        accounts = self.get_all_accounts()
+        return sum(acc.balance for acc in accounts if acc.currency == currency)

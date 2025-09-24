@@ -1,4 +1,5 @@
 import click
+import os
 from pathlib import Path
 from rich import print
 from rich.console import Console
@@ -6,6 +7,7 @@ from rich.table import Table
 
 from budgetpal.application.services import RecurringTransactionService, ReportingService
 from budgetpal.infrastructure.database import Database, DatabaseConfig
+from budgetpal.infrastructure.logging import configure_logging, get_logger
 from budgetpal.presentation.app import BudgetPalApp
 
 console = Console()
@@ -18,20 +20,76 @@ console = Console()
     help="Path to database file",
     default=None,
 )
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    default="INFO",
+    help="Set logging level",
+)
+@click.option(
+    "--log-file",
+    type=click.Path(path_type=Path),
+    help="Log file path (optional)",
+    default=None,
+)
 @click.pass_context
-def cli(ctx, db_path):
+def cli(ctx, db_path, log_level, log_file):
     """BudgetPal - A modern CLI budget planner"""
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
+
+    # Configure logging
+    configure_logging(log_level, str(log_file) if log_file else None)
+    logger = get_logger("budgetpal.cli")
+    logger.info("BudgetPal CLI started", log_level=log_level, db_path=str(db_path) if db_path else None)
 
 
 @cli.command()
 @click.pass_context
 def app(ctx):
     """Launch the interactive TUI application"""
+    # Check for debug mode
+    if os.environ.get("DEBUGPY") == "1":
+        try:
+            import debugpy
+            port = int(os.environ.get("DEBUGPY_PORT", "5678"))
+            debugpy.listen(("localhost", port))
+            print(f"🐛 Debug mode enabled - waiting for debugger on port {port}")
+            print("   In VSCode: Run & Debug > Attach to Python")
+            debugpy.wait_for_client()
+            print("✅ Debugger attached!")
+        except ImportError:
+            print("⚠️  debugpy not installed. Install with: poetry add --group dev debugpy")
+        except Exception as e:
+            print(f"⚠️  Debug setup failed: {e}")
+
+    # For TUI apps, set up file logging if not already configured
+    if not ctx.parent.params.get("log_file"):
+        default_log_file = Path.home() / ".budgetpal" / "logs" / "budgetpal.log"
+        default_log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Reconfigure logging with file output
+        configure_logging(
+            log_level=ctx.parent.params.get("log_level", "INFO"),
+            log_file=str(default_log_file)
+        )
+
+        print(f"💡 TUI Mode: Logs are being written to {default_log_file}")
+        print(f"   Watch logs: tail -f {default_log_file}")
+        print()
+
+    logger = get_logger("budgetpal.cli.app")
     db_path = ctx.obj.get("db_path")
-    app = BudgetPalApp(db_path)
-    app.run()
+
+    logger.info("Starting BudgetPal TUI application", db_path=str(db_path) if db_path else None)
+
+    try:
+        app = BudgetPalApp(db_path)
+        app.run()
+        logger.info("BudgetPal application closed successfully")
+    except Exception as e:
+        logger.error("Application failed to start", error=str(e), exc_info=True)
+        raise
 
 
 @cli.command()
